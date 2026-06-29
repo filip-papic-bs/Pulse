@@ -1,4 +1,6 @@
 import { chromium } from "playwright";
+import { flowFor } from "./games/index.mjs";
+import { runSteps } from "./games/steps.mjs";
 
 const timeoutMs = Number(process.env.PULSE_TIMEOUT_MS ?? 45_000);
 const iframeFallbackMs = Number(process.env.PULSE_IFRAME_FALLBACK_MS ?? 12_000);
@@ -125,6 +127,7 @@ async function buildTargets(context) {
       targets.push({
         site: site.name,
         name: game.name,
+        slug: game.slug,
         url: `${site.baseUrl}/originals/${game.slug}`,
       });
     }
@@ -195,12 +198,15 @@ async function checkGame(context, game) {
 
     const ready = await waitForGame(page);
 
+    const flow = flowFor(game.slug);
+    const flowResult = flow ? await runSteps(flow.steps, page) : { ok: true, failed: null };
+
     return {
       ...game,
-      ok: true,
+      ok: flowResult.ok,
       ready,
       ms: Date.now() - started,
-      error: null,
+      error: flowResult.ok ? null : `failed step: ${flowResult.failed}`,
       failedRequests,
     };
   } catch (error) {
