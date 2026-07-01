@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import path from "node:path";
 import { chromium } from "playwright";
 import { flowFor } from "./games/index.mjs";
 import { runSteps } from "./games/steps.mjs";
@@ -7,6 +9,9 @@ const iframeFallbackMs = Number(process.env.PULSE_IFRAME_FALLBACK_MS ?? 12_000);
 const headless = process.env.PULSE_HEADLESS !== "false";
 const slackWebhookUrl = process.env.PULSE_SLACK_WEBHOOK_URL ?? "";
 const slackSend = process.env.PULSE_SLACK_SEND === "true";
+const recheckEnabled = process.env.PULSE_RECHECK !== "false";
+const recheckDelayMs = Number(process.env.PULSE_RECHECK_DELAY_MS ?? 300_000);
+const reportBaseDir = process.env.PULSE_REPORT_DIR ?? "data";
 const canvasSelectors = ["#gameParent canvas", "canvas"];
 const iframeSelectors = ["iframe"];
 const readySelectors = [...canvasSelectors, ...iframeSelectors];
@@ -172,7 +177,7 @@ async function waitForGame(page) {
   return null;
 }
 
-async function checkGame(context, game) {
+async function checkGame(context, game, options = {}) {
   const page = await context.newPage();
   const started = Date.now();
   const failedRequests = [];
@@ -186,6 +191,7 @@ async function checkGame(context, game) {
     }
   });
 
+  let outcome;
   try {
     const response = await page.goto(game.url, {
       waitUntil: "domcontentloaded",
@@ -201,7 +207,7 @@ async function checkGame(context, game) {
     const flow = flowFor(game.slug);
     const flowResult = flow ? await runSteps(flow.steps, page) : { ok: true, failed: null };
 
-    return {
+    outcome = {
       ...game,
       ok: flowResult.ok,
       ready,
@@ -210,7 +216,7 @@ async function checkGame(context, game) {
       failedRequests,
     };
   } catch (error) {
-    return {
+    outcome = {
       ...game,
       ok: false,
       ready: null,
@@ -219,17 +225,22 @@ async function checkGame(context, game) {
       failedRequests,
     };
   } finally {
+    if (!outcome?.ok && options.screenshotPath) {
+      try {
+        await page.screenshot({ path: options.screenshotPath, fullPage: true });
+        outcome.screenshot = options.screenshotPath;
+      } catch (error) {
+        console.log(
+          `Screenshot failed for ${game.site}/${game.name}: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
     await page.close().catch(() => undefined);
   }
+  return outcome;
 }
 
-async function maybeNotify(results) {
-  const failed = results.filter((result) => !result.ok);
-  if (!failed.length) {
-    console.log("Slack: no failures, no message sent.");
-    return;
-  }
-
+function summarize(failed, headerLines) {
   const bySite = new Map();
   for (const result of failed) {
     const games = bySite.get(result.site) ?? new Map();
@@ -239,15 +250,17 @@ async function maybeNotify(results) {
     bySite.set(result.site, games);
   }
 
-  const lines = ["PULSE: URGENT! 🚨 Non-working games detected:"];
+  const lines = [...headerLines];
   for (const [site, games] of bySite) {
-    lines.push(`${site}:`);
+    lines.push(`${site.toUpperCase()}:`);
     for (const [game, error] of games) {
       lines.push(`- ${game}: ${error}`);
     }
   }
-  const text = lines.join("\n");
+  return lines.join("\n");
+}
 
+async function postSlack(text) {
   if (!slackWebhookUrl) {
     console.log(`Slack: dry-run, no webhook configured. Would post:\n${text}`);
     return;
@@ -265,6 +278,78 @@ async function maybeNotify(results) {
   });
   if (!response.ok) {
     throw new Error(`Slack webhook failed: HTTP ${response.status}`);
+  }
+}
+
+async function writeReport(reportDir, meta, confirmed) {
+  const failures = confirmed.map((result) => ({
+    site: result.site,
+    name: result.name,
+    slug: result.slug,
+    url: result.url,
+    error: result.error,
+    ready: result.ready,
+    ms: result.ms,
+    failedRequests: result.failedRequests,
+    screenshot: result.screenshot ? path.basename(result.screenshot) : null,
+  }));
+
+  const json = {
+    generatedAt: new Date().toISOString(),
+    firstCheckAt: meta.firstCheckAt,
+    secondCheckAt: meta.secondCheckAt,
+    waitMinutes: Math.round(meta.waitMs / 60_000),
+    failureCount: failures.length,
+    failures,
+  };
+  await fs.writeFile(
+    path.join(reportDir, "report.json"),
+    `${JSON.stringify(json, null, 2)}\n`,
+  );
+
+  const md = [
+    "# Pulse failure report",
+    "",
+    `- First check: ${meta.firstCheckAt}`,
+    `- Re-check:    ${meta.secondCheckAt}`,
+    `- Wait:        ${Math.round(meta.waitMs / 60_000)} min`,
+    `- Confirmed failures: ${failures.length}`,
+    "",
+  ];
+  for (const failure of failures) {
+    md.push(`## ${failure.site} / ${failure.name}`);
+    md.push("");
+    md.push(`- URL: ${failure.url}`);
+    md.push(`- Error: ${failure.error}`);
+    md.push(`- Ready: ${failure.ready}`);
+    md.push(`- Duration: ${failure.ms}ms`);
+    if (failure.screenshot) {
+      md.push(`- Screenshot: ${failure.screenshot}`);
+    }
+    if (failure.failedRequests?.length) {
+      md.push("- Failed requests:");
+      for (const request of failure.failedRequests) {
+        md.push(`  - ${request}`);
+      }
+    }
+    md.push("");
+  }
+  await fs.writeFile(path.join(reportDir, "report.md"), md.join("\n"));
+}
+
+async function pruneReports(keep = 10) {
+  const entries = await fs.readdir(reportBaseDir, { withFileTypes: true });
+  // Report folders are timestamp-named, so lexicographic order is chronological.
+  const dirs = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  const stale = dirs.slice(0, Math.max(0, dirs.length - keep));
+  for (const name of stale) {
+    await fs.rm(path.join(reportBaseDir, name), { recursive: true, force: true });
+  }
+  if (stale.length) {
+    console.log(`Pruned ${stale.length} old report(s), keeping newest ${keep}.`);
   }
 }
 
@@ -291,6 +376,9 @@ function printResults(results) {
   );
 }
 
+const keyOf = (game) => `${game.site}/${game.slug}`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function main() {
   const browser = await chromium.launch({ headless });
   const context = await browser.newContext({
@@ -311,11 +399,69 @@ async function main() {
       results.push(await checkGame(context, game));
     }
     printResults(results);
-    await maybeNotify(results);
 
-    if (results.some((result) => !result.ok)) {
-      process.exitCode = 1;
+    const failed = results.filter((result) => !result.ok);
+    if (!failed.length) {
+      console.log("All healthy. No alert.");
+      return;
     }
+
+    if (!recheckEnabled) {
+      await postSlack(summarize(failed, ["URGENT! 🚨 Non-working games detected:"]));
+      process.exitCode = 1;
+      return;
+    }
+
+    const waitMinutes = Math.round(recheckDelayMs / 60_000);
+    console.log(
+      `First check: ${failed.length} failure(s). Waiting ${waitMinutes} min before re-check to rule out a transient blip.`,
+    );
+    const firstCheckAt = new Date().toISOString();
+    await sleep(recheckDelayMs);
+
+    const failedKeys = new Set(failed.map(keyOf));
+    const recheckTargets = targets.filter((target) => failedKeys.has(keyOf(target)));
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const reportDir = path.join(reportBaseDir, stamp);
+    await fs.mkdir(reportDir, { recursive: true });
+
+    console.log(`--- Re-check (${recheckTargets.length} game(s)) ---`);
+    const recheck = [];
+    for (const game of recheckTargets) {
+      const screenshotPath = path.join(reportDir, `${game.site}-${game.slug}.png`);
+      recheck.push(await checkGame(context, game, { screenshotPath }));
+    }
+    printResults(recheck);
+
+    for (const result of recheck.filter((result) => result.ok)) {
+      console.log(`RECOVERED ${result.site}/${result.name} (transient, dropped)`);
+    }
+
+    const confirmed = recheck.filter((result) => !result.ok);
+    if (!confirmed.length) {
+      console.log(
+        "All failures recovered on re-check — transient blip. No alert, no report.",
+      );
+      await fs.rm(reportDir, { recursive: true, force: true }).catch(() => undefined);
+      return;
+    }
+
+    const secondCheckAt = new Date().toISOString();
+    await writeReport(
+      reportDir,
+      { firstCheckAt, secondCheckAt, waitMs: recheckDelayMs },
+      confirmed,
+    );
+    console.log(`Report written to ${reportDir}/ (report.json, report.md, screenshots)`);
+    await pruneReports(10);
+
+    const summary = summarize(confirmed, [
+      `URGENT! 🚨 Non-working games — confirmed over 2 checks ${waitMinutes} min apart:`,
+    ]);
+    await postSlack(`${summary}\n\n(Screenshots + report saved to ${reportDir})`);
+
+    process.exitCode = 1;
   } finally {
     await context.close();
     await browser.close();

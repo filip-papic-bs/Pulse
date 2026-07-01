@@ -12,7 +12,9 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    permissions:
+      contents: write 
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -35,4 +37,19 @@ jobs:
           PULSE_GAMES: ${{ vars.PULSE_GAMES }}
           PULSE_TIMEOUT_MS: "45000"
           PULSE_HEADLESS: "true"
+          PULSE_RECHECK: "true"
+          PULSE_RECHECK_DELAY_MS: "300000"
         run: npm run check
+
+      - name: Commit failure report
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain data)" ]; then
+            echo "No report to commit."
+            exit 0
+          fi
+          git config user.name "pulse-bot"
+          git config user.email "pulse-bot@users.noreply.github.com"
+          git add data
+          git commit -m "pulse: failure report [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
