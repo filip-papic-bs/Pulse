@@ -1,0 +1,31 @@
+{
+  "generatedAt": "2026-07-02T21:39:57.678Z",
+  "firstCheckAt": "2026-07-02T21:34:20.116Z",
+  "secondCheckAt": "2026-07-02T21:39:57.677Z",
+  "waitMinutes": 5,
+  "failureCount": 2,
+  "failures": [
+    {
+      "site": "cashy",
+      "name": "Plinko",
+      "slug": "plinko-originals",
+      "url": "https://cashy.com/originals/plinko-originals",
+      "error": "failed step: click .bet-button",
+      "ready": "iframe",
+      "ms": 18382,
+      "failedRequests": [],
+      "screenshot": "cashy-plinko-originals.png"
+    },
+    {
+      "site": "cashy",
+      "name": "Wheel",
+      "slug": "wheel-originals",
+      "url": "https://cashy.com/originals/wheel-originals",
+      "error": "failed step: click .bet-button",
+      "ready": "iframe",
+      "ms": 18365,
+      "failedRequests": [],
+      "screenshot": "cashy-wheel-originals.png"
+    }
+  ]
+}
